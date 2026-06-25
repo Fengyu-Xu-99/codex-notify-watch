@@ -370,15 +370,17 @@ class Watcher:
             self.notify(title, message, sound)
 
     def notify(self, title: str, message: str, sound: str) -> None:
+        # Fire banner and sound without blocking. afplay blocks until the clip
+        # finishes, so running it inline delayed the banner by ~1-2s.
+        script = f'display notification {apple_quote(message)} with title {apple_quote(title)}'
+        self.spawn_command(["/usr/bin/osascript", "-l", "AppleScript", "-e", script])
         sound_path = Path("/System/Library/Sounds") / f"{sound}.aiff"
         if sound_path.exists():
-            self.run_command(["/usr/bin/afplay", str(sound_path)])
-        script = f'display notification {apple_quote(message)} with title {apple_quote(title)}'
-        self.run_command(["/usr/bin/osascript", "-l", "AppleScript", "-e", script])
+            self.spawn_command(["/usr/bin/afplay", str(sound_path)])
 
-    def run_command(self, args: list[str]) -> None:
+    def spawn_command(self, args: list[str]) -> None:
         try:
-            subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as exc:
             self.log(f"notification command failed {shlex.join(args)}: {exc!r}")
 
