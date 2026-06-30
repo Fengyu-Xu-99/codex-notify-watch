@@ -31,9 +31,11 @@ The installer:
 3. Loads the agent immediately -- the watcher starts right away.
 4. On every subsequent login the watcher starts automatically, no terminal needed.
 
+At the end it prints status, log, stop, and uninstall commands, plus a reminder to enable macOS notifications.
+
 ### One manual step (macOS won't let a script do this)
 
-In **System Settings → Notifications → osascript** (or terminal-notifier if installed):
+In **System Settings → Notifications**, enable notifications for **codex-watch-menu** if you installed the menu app. Otherwise enable **osascript**:
 1. **Allow notifications: ON**
 2. **Alert style: Banners** or **Alerts**
 
@@ -54,10 +56,16 @@ Stops the watcher, unloads the LaunchAgent, and removes the plist. The script co
 ## Status and manual control
 
 ```sh
+# Version
+python3 ~/.codex/codex_notify_watch.py --version
+
 # Is it running?
 python3 ~/.codex/codex_notify_watch.py --status
 # running pid=12345
 # not running
+
+# Show useful Codex/watch log paths
+python3 ~/.codex/codex_notify_watch.py --logs
 
 # Stop it manually
 python3 ~/.codex/codex_notify_watch.py --stop
@@ -70,7 +78,37 @@ python3 ~/.codex/codex_notify_watch.py --self-test
 
 # Reprocess all existing log rows from the beginning
 python3 ~/.codex/codex_notify_watch.py --from-beginning
+
+# Recent session status
+python3 ~/.codex/codex_notify_watch.py --sessions
 ```
+
+## Optional menu bar app
+
+V2 includes a small native macOS menu bar app. It does not replace the watcher; it reads status from the installed Python script.
+
+```sh
+./install-menu.sh
+```
+
+Look for **Codex** in the macOS menu bar. The title shows a count for running sessions, or `!N` when recent sessions need approval.
+
+The menu includes:
+- clickable recent session statuses
+- manual refresh
+- watcher status
+- useful log paths
+- quit
+
+Clicking a session opens VS Code on the workspace Codex used for that session and asks the Codex extension to navigate to that local thread route when available. Notification banners are also delivered by the menu app when it is installed, so clicking **Show** uses the same routing instead of opening `osascript`.
+
+Uninstall just the menu app:
+
+```sh
+./uninstall-menu.sh
+```
+
+The menu status is intentionally coarse. Codex completion rows are not always tied directly to a session in SQLite, so old inactive sessions are shown as `completed`, fresh log activity is shown as `running`, and only recent pending tool calls are shown as `needs approval`.
 
 ## How it works
 
@@ -102,8 +140,15 @@ It reads session names from `~/.codex/session_index.jsonl` to label banners. It 
 ~/.codex/codex-notify-watch.stdout.log  # launchd stdout capture
 ~/.codex/codex-notify-watch.stderr.log  # launchd stderr capture
 
+# Optional menu bar runtime
+~/.codex/codex-watch-menu               # menu app binary (written by install-menu.sh)
+~/.codex/codex-watch-menu.stdout.log    # menu stdout capture
+~/.codex/codex-watch-menu.stderr.log    # menu stderr capture
+~/.codex/codex-watch-menu-notifications.jsonl # click-aware notification queue
+
 # LaunchAgent
 ~/Library/LaunchAgents/com.codex-notify-watch.plist
+~/Library/LaunchAgents/com.codex-watch-menu.plist
 ```
 
 ## Options
@@ -119,8 +164,13 @@ It reads session names from `~/.codex/session_index.jsonl` to label banners. It 
 --approval-grace SECONDS  Delay before approval heuristic fires. Default: 1.5
 --dry-run                 Log alerts without playing sound or showing banners.
 --from-beginning          Process all existing log rows, not just new ones.
+--version                 Print version and exit.
 --self-test               Run built-in dry tests and exit.
 --status                  Print running status and exit.
+--logs                    Print useful Codex/watch log paths and exit.
+--sessions                Print recent Codex session statuses and exit.
+--sessions-json           Print recent Codex session statuses as JSON.
+--sessions-limit N        Number of recent sessions to show. Default: 8.
 --stop                    Stop the running watcher and exit.
 ```
 
@@ -138,6 +188,13 @@ The notification daemon is stuck. Run:
 ```sh
 killall NotificationCenter usernoted
 ```
+
+**No banners appear**
+Open **System Settings → Notifications → osascript** and enable notifications. If `osascript` is missing from the list, run:
+```sh
+osascript -e 'display notification "Test" with title "Codex Watch"'
+```
+Then check System Settings again.
 
 **No sound but banners appear**
 Sounds are played via `afplay /System/Library/Sounds/<name>.aiff` independently of the banner, so this shouldn't happen. Check that the sound files exist:

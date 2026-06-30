@@ -26,10 +26,17 @@ DEFAULT_DB = CODEX_HOME / "logs_2.sqlite"
 DEFAULT_SESSION_INDEX = CODEX_HOME / "session_index.jsonl"
 DEFAULT_STATE = CODEX_HOME / "codex-notify-watch.state.json"
 DEFAULT_LOG = CODEX_HOME / "codex-notify-watch.log"
+DEFAULT_STDOUT_LOG = CODEX_HOME / "codex-notify-watch.stdout.log"
+DEFAULT_STDERR_LOG = CODEX_HOME / "codex-notify-watch.stderr.log"
+DEFAULT_MENU_BIN = CODEX_HOME / "codex-watch-menu"
+DEFAULT_MENU_NOTIFY = CODEX_HOME / "codex-watch-menu-notifications.jsonl"
 DEFAULT_PID = CODEX_HOME / "codex-notify-watch.pid"
 DEFAULT_LOCK = CODEX_HOME / "codex-notify-watch.lock"
 DEFAULT_POLL_SECONDS = 0.5
 DEFAULT_APPROVAL_GRACE_SECONDS = 1.5
+SESSION_ACTIVE_SECONDS = 15 * 60
+SESSION_PENDING_SECONDS = 10 * 60
+VERSION = "2.0.0"
 FINISH_SOUND = "Ping"
 APPROVAL_SOUND = "Glass"
 USER_INPUT_SOUND = "Tink"
@@ -46,6 +53,7 @@ NAME_RE = re.compile(r'"name"\s*:\s*"([^"]+)"')
 ARGS_RE = re.compile(r'"arguments"\s*:\s*"((?:\\.|[^"\\])*)"')
 CMD_RE = re.compile(r'\\"cmd\\"\s*:\s*\\"((?:\\\\.|[^"\\])*)\\"')
 QUESTION_RE = re.compile(r'\\"question\\"\s*:\s*\\"((?:\\\\.|[^"\\])*)\\"')
+CWD_RE = re.compile(r" cwd=(.*?)(?= [A-Za-z0-9_.:-]+=|}|$)")
 
 
 @dataclass
@@ -68,6 +76,24 @@ class PendingCall:
     summary: str
     alerted: bool = False
     dispatched: bool = False
+
+
+@dataclass
+class SessionInfo:
+    thread_id: str
+    title: str
+    updated_at: str
+
+
+@dataclass
+class SessionStatus:
+    thread_id: str
+    title: str
+    status: str
+    updated_at: str
+    last_log_id: int
+    last_log_ts: int
+    cwd: str | None
 
 
 class Watcher:
@@ -100,6 +126,7 @@ class Watcher:
         self.pending_calls: dict[str, PendingCall] = {}
         self.alerted_keys: set[str] = set()
         self.thread_titles: dict[str, str] = {}
+        self.thread_cwds: dict[str, str] = {}
         self.thread_titles_loaded_at = 0.0
         self.stop_requested = False
 
@@ -229,27 +256,32 @@ class Watcher:
     def process_row(self, row: LogRow, now: float) -> None:
         if row.thread_id:
             self.last_thread_id = row.thread_id
+            cwd = self.extract_cwd(row.body)
+            if cwd:
+                self.thread_cwds[row.thread_id] = cwd
 
         if self.is_finish_event(row):
             thread_id = row.thread_id or self.last_thread_id
             label = self.thread_label(thread_id)
             key = f"finish:{thread_id}:{row.id}"
-            self.alert_once(key, f"Codex: {label}", "Finished", FINISH_SOUND)
+            self.alert_once(key, f"Codex: {label}", "Finished", FINISH_SOUND, thread_id)
             return
 
         if self.is_user_input_tool_call(row):
-            label = self.thread_label(row.thread_id or self.last_thread_id)
+            thread_id = row.thread_id or self.last_thread_id
+            label = self.thread_label(thread_id)
             key = f"user-input:{row.id}"
-            self.alert_once(key, f"Codex: {label}", self.command_summary(row.body, "request_user_input"), USER_INPUT_SOUND)
+            self.alert_once(key, f"Codex: {label}", self.command_summary(row.body, "request_user_input"), USER_INPUT_SOUND, thread_id)
             return
 
         call = self.extract_function_call(row)
         if call:
             call_id, tool_name, summary = call
             if tool_name == "request_user_input":
-                label = self.thread_label(row.thread_id or self.last_thread_id)
+                thread_id = row.thread_id or self.last_thread_id
+                label = self.thread_label(thread_id)
                 key = f"user-input:{call_id}"
-                self.alert_once(key, f"Codex: {label}", summary, USER_INPUT_SOUND)
+                self.alert_once(key, f"Codex: {label}", summary, USER_INPUT_SOUND, thread_id)
                 return
             if not self.should_track_approval_tool(tool_name):
                 return
@@ -343,6 +375,13 @@ class Watcher:
                 return question_match.group(1).replace("\\\\", "\\")
         return None
 
+    def extract_cwd(self, body: str) -> str | None:
+        match = CWD_RE.search(body)
+        if not match:
+            return None
+        cwd = match.group(1).strip()
+        return cwd or None
+
     def check_pending(self, now: float) -> None:
         expired: list[str] = []
         for call_id, call in self.pending_calls.items():
@@ -355,21 +394,24 @@ class Watcher:
                 continue
             if now - call.first_seen >= self.approval_grace_seconds:
                 key = f"approval:{call.call_id}"
-                label = self.thread_label(call.thread_id or self.last_thread_id)
-                self.alert_once(key, f"Codex: {label}", call.summary, APPROVAL_SOUND)
+                thread_id = call.thread_id or self.last_thread_id
+                label = self.thread_label(thread_id)
+                self.alert_once(key, f"Codex: {label}", call.summary, APPROVAL_SOUND, thread_id)
                 call.alerted = True
         for call_id in expired:
             self.pending_calls.pop(call_id, None)
 
-    def alert_once(self, key: str, title: str, message: str, sound: str) -> None:
+    def alert_once(self, key: str, title: str, message: str, sound: str, thread_id: str | None = None) -> None:
         if key in self.alerted_keys:
             return
         self.alerted_keys.add(key)
         self.log(f"alert {key}: {message}")
         if not self.dry_run:
-            self.notify(title, message, sound)
+            self.notify(key, title, message, sound, thread_id)
 
-    def notify(self, title: str, message: str, sound: str) -> None:
+    def notify(self, key: str, title: str, message: str, sound: str, thread_id: str | None) -> None:
+        if DEFAULT_MENU_BIN.exists() and self.write_menu_notification(key, title, message, sound, thread_id):
+            return
         # Fire banner and sound without blocking. afplay blocks until the clip
         # finishes, so running it inline delayed the banner by ~1-2s.
         script = f'display notification {apple_quote(message)} with title {apple_quote(title)}'
@@ -377,6 +419,25 @@ class Watcher:
         sound_path = Path("/System/Library/Sounds") / f"{sound}.aiff"
         if sound_path.exists():
             self.spawn_command(["/usr/bin/afplay", str(sound_path)])
+
+    def write_menu_notification(self, key: str, title: str, message: str, sound: str, thread_id: str | None) -> bool:
+        try:
+            DEFAULT_MENU_NOTIFY.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "id": f"{int(time.time() * 1000)}-{key}",
+                "title": title,
+                "message": message,
+                "sound": sound,
+                "thread_id": thread_id,
+                "cwd": self.thread_cwds.get(thread_id or ""),
+                "created_at": int(time.time()),
+            }
+            with DEFAULT_MENU_NOTIFY.open("a") as handle:
+                handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            return True
+        except Exception as exc:
+            self.log(f"could not write menu notification: {exc!r}")
+            return False
 
     def spawn_command(self, args: list[str]) -> None:
         try:
@@ -467,6 +528,25 @@ def print_status(pid_path: Path) -> int:
     return 1
 
 
+def print_logs(args: argparse.Namespace) -> int:
+    paths = [
+        ("Codex SQLite DB", args.db),
+        ("Codex session index", args.session_index),
+        ("Watcher debug log", args.log),
+        ("Watcher stdout log", DEFAULT_STDOUT_LOG),
+        ("Watcher stderr log", DEFAULT_STDERR_LOG),
+        ("Menu notification queue", DEFAULT_MENU_NOTIFY),
+        ("Watcher state", args.state),
+        ("Watcher PID", args.pid_file),
+        ("Watcher lock", args.lock_file),
+    ]
+    for label, path in paths:
+        expanded = path.expanduser()
+        status = "exists" if expanded.exists() else "missing"
+        print(f"{label}: {expanded} ({status})")
+    return 0
+
+
 def stop_running(pid_path: Path, log_path: Path) -> int:
     pid = read_pid(pid_path)
     if not pid_is_running(pid):
@@ -486,6 +566,145 @@ def stop_running(pid_path: Path, log_path: Path) -> int:
     except Exception:
         pass
     return 2
+
+
+def read_session_infos(path: Path, limit: int) -> list[SessionInfo]:
+    if not path.expanduser().exists():
+        return []
+    sessions: dict[str, SessionInfo] = {}
+    try:
+        with path.expanduser().open() as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                thread_id = item.get("id")
+                title = item.get("thread_name")
+                updated_at = item.get("updated_at", "")
+                if isinstance(thread_id, str) and isinstance(title, str) and title:
+                    sessions[thread_id] = SessionInfo(thread_id, title, str(updated_at))
+    except Exception as exc:
+        print(f"could not read session index: {exc!r}", file=sys.stderr)
+        return []
+    ordered = sorted(sessions.values(), key=lambda item: item.updated_at, reverse=True)
+    return ordered[:limit]
+
+
+def fetch_session_rows(db_path: Path, thread_ids: list[str]) -> list[LogRow]:
+    if not thread_ids or not db_path.expanduser().exists():
+        return []
+    placeholders = ",".join("?" for _ in thread_ids)
+    uri = f"file:{db_path.expanduser()}?mode=ro&cache=shared"
+    with sqlite3.connect(uri, uri=True, timeout=1) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            select id, ts, ts_nanos, level, target, feedback_log_body, thread_id
+            from logs
+            where thread_id in ({placeholders})
+            order by id asc
+            """,
+            thread_ids,
+        ).fetchall()
+    return [
+        LogRow(
+            id=int(row["id"]),
+            ts=int(row["ts"]),
+            ts_nanos=int(row["ts_nanos"]),
+            level=str(row["level"]),
+            target=str(row["target"]),
+            body=str(row["feedback_log_body"] or ""),
+            thread_id=row["thread_id"],
+        )
+        for row in rows
+    ]
+
+
+def session_statuses(args: argparse.Namespace) -> list[SessionStatus]:
+    infos = read_session_infos(args.session_index, args.sessions_limit)
+    if not infos:
+        return []
+    watcher = Watcher(
+        db_path=args.db,
+        session_index_path=args.session_index,
+        state_path=args.state,
+        log_path=args.log,
+        pid_path=args.pid_file,
+        lock_path=args.lock_file,
+    )
+    by_thread = {
+        info.thread_id: {"last_log_id": 0, "last_log_ts": 0, "completed_id": 0, "pending": {}, "cwd": None}
+        for info in infos
+    }
+    rows = fetch_session_rows(args.db, [info.thread_id for info in infos])
+    for row in rows:
+        if not row.thread_id or row.thread_id not in by_thread:
+            continue
+        state = by_thread[row.thread_id]
+        state["last_log_id"] = max(int(state["last_log_id"]), row.id)
+        state["last_log_ts"] = max(int(state["last_log_ts"]), row.ts)
+        cwd = watcher.extract_cwd(row.body)
+        if cwd:
+            state["cwd"] = cwd
+        if watcher.is_finish_event(row):
+            state["completed_id"] = row.id
+            state["pending"] = {}
+            continue
+        call = watcher.extract_function_call(row)
+        if call:
+            call_id, tool_name, _summary = call
+            if watcher.should_track_approval_tool(tool_name):
+                state["pending"][call_id] = row.ts
+            continue
+        dispatched = watcher.extract_dispatched_call_id(row)
+        if dispatched:
+            state["pending"].pop(dispatched, None)
+
+    statuses: list[SessionStatus] = []
+    now = int(time.time())
+    for info in infos:
+        state = by_thread[info.thread_id]
+        fresh_pending = any(now - ts <= SESSION_PENDING_SECONDS for ts in state["pending"].values())
+        fresh_activity = bool(state["last_log_ts"]) and now - int(state["last_log_ts"]) <= SESSION_ACTIVE_SECONDS
+        if fresh_pending:
+            status = "needs approval"
+        elif fresh_activity:
+            status = "running"
+        elif state["last_log_id"]:
+            status = "completed"
+        else:
+            status = "unknown"
+        statuses.append(
+            SessionStatus(
+                thread_id=info.thread_id,
+                title=info.title,
+                status=status,
+                updated_at=info.updated_at,
+                last_log_id=int(state["last_log_id"]),
+                last_log_ts=int(state["last_log_ts"]),
+                cwd=state["cwd"],
+            )
+        )
+    return statuses
+
+
+def print_sessions(args: argparse.Namespace) -> int:
+    statuses = session_statuses(args)
+    if args.sessions_json:
+        print(json.dumps([status.__dict__ for status in statuses], indent=2))
+        return 0
+    if not statuses:
+        print("No Codex sessions found.")
+        return 1
+    width = min(max(len(status.title) for status in statuses), 48)
+    for status in statuses:
+        title = status.title if len(status.title) <= width else status.title[: width - 3] + "..."
+        print(f"{title:<{width}}  {status.status}")
+    return 0
 
 
 def run_self_test() -> int:
@@ -572,6 +791,7 @@ def run_self_test() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Watch Codex logs for finish/approval alerts.")
+    parser.add_argument("--version", action="store_true", help="Print version and exit.")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="Path to Codex logs sqlite DB.")
     parser.add_argument(
         "--session-index",
@@ -594,16 +814,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--from-beginning", action="store_true", help="Process old log rows too.")
     parser.add_argument("--self-test", action="store_true", help="Run built-in dry tests and exit.")
     parser.add_argument("--status", action="store_true", help="Print whether the watcher is running and exit.")
+    parser.add_argument("--logs", action="store_true", help="Print useful Codex/watch log paths and exit.")
+    parser.add_argument("--sessions", action="store_true", help="Print recent Codex session statuses and exit.")
+    parser.add_argument("--sessions-json", action="store_true", help="Print recent Codex session statuses as JSON.")
+    parser.add_argument("--sessions-limit", type=int, default=8, help="Number of recent sessions to show.")
     parser.add_argument("--stop", action="store_true", help="Stop the running watcher and exit.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.version:
+        print(f"codex-notify-watch {VERSION}")
+        return 0
     if args.self_test:
         return run_self_test()
     if args.status:
         return print_status(args.pid_file)
+    if args.logs:
+        return print_logs(args)
+    if args.sessions or args.sessions_json:
+        return print_sessions(args)
     if args.stop:
         return stop_running(args.pid_file, args.log)
     watcher = Watcher(

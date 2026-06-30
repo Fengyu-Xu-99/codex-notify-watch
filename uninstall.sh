@@ -4,7 +4,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYSCRIPT="$SCRIPT_DIR/codex_notify_watch.py"
+INSTALLED_PYSCRIPT="$HOME/.codex/codex_notify_watch.py"
+REPO_PYSCRIPT="$SCRIPT_DIR/codex_notify_watch.py"
 PLIST_LABEL="com.codex-notify-watch"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 
@@ -12,7 +13,11 @@ PYTHON3="$(command -v python3 2>/dev/null || true)"
 
 # Stop running instance
 if [[ -n "$PYTHON3" ]]; then
-  "$PYTHON3" "$PYSCRIPT" --stop 2>/dev/null || true
+  if [[ -f "$INSTALLED_PYSCRIPT" ]]; then
+    "$PYTHON3" "$INSTALLED_PYSCRIPT" --stop 2>/dev/null || true
+  elif [[ -f "$REPO_PYSCRIPT" ]]; then
+    "$PYTHON3" "$REPO_PYSCRIPT" --stop 2>/dev/null || true
+  fi
 fi
 
 if [[ -f "$PLIST_PATH" ]]; then
